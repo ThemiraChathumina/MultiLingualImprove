@@ -12,7 +12,17 @@ import math
 from model import MPTModel
 from utils import set_seed, save_with_accelerate
 from read_data import ExperimentDataset, llm_input_features
-from Configs import IDPConfigs
+
+system_prompt = (
+    "You are an intelligent assistant that analyzes product reviews and extracts aspect-based sentiment information. "
+    "For each review, identify the following aspects: Overall, Quality, Sizing, Packaging, Support, Description, and Value. "
+    "For each aspect, provide:\n"
+    " - 'name': The name of the aspect\n"
+    " - 'rating': An integer from 0 to 5 representing sentiment (0 means not mentioned)\n"
+    " - 'justification': A brief explanation based on the review text.\n"
+    "If an aspect is not mentioned, set justification to 'Not mentioned in the review.' and rating to 0.\n"
+    "Output must be in JSON format with the key 'aspects' containing a list of the 7 aspect dictionaries."
+)
 
 class Arguments:
     def __init__(self):
@@ -20,49 +30,33 @@ class Arguments:
         TOTAL_BATCH_SIZE=8
         GRADIENT_ACC_STEPS = TOTAL_BATCH_SIZE // BATCH_SIZE_PER_GPU
 
-        self.configs = IDPConfigs()
 
-        self.llm_path = "meta-llama/Llama-3.2-1B-Instruct"
-        self.mt_path = "google/mt5-large"
+        self.llm_path = "/root/MultiLingualImprove/experiments/llama_1b_sentiment_analysis"
+        self.mt_path = "google/mt5-xl"
         self.ext_path = "facebook/nllb-200-distilled-600M"
         self.train_num = 8888
-        self.dev_size = 1000
+        self.dev_size = 0
         self.lr = 3e-5
-        self.epoch_num = self.configs.num_epochs
+        self.epoch_num = 3
         self.gradient_accumulation = GRADIENT_ACC_STEPS
-        self.max_seq_len = 200
-        self.max_gen_len = 200
+        self.max_seq_len = 500
+        self.max_gen_len = 500
         self.train_batch_size = TOTAL_BATCH_SIZE
         self.eval_batch_size = BATCH_SIZE_PER_GPU
         self.train_micro_batch_size_per_gpu = BATCH_SIZE_PER_GPU
-        self.augmentation = False
-        self.save_name = self.configs.save_name
-        self.stage_name = self.configs.args
+        self.augmentation = True
+        self.save_name = 'sentiment'
+        self.stage_name = 'aug'
         self.report_to = 'wandb'
-        self.logging_steps = 1000
+        self.logging_steps = 100
         self.warm_rate = 0.05
         self.lr_scheduler_name = 'cosine'
-        self.system_prompt = self.configs.system_prompt
+        self.system_prompt = system_prompt
         self.init_checkpoint = None
-
-def apply_chat_template(system_prompt, user_prompt, tokenizer_llm, tokenize=False, add_generation_prompt=True):
-    # This function is a placeholder for the actual implementation of applying a chat template.
-    # In a real scenario, this would format the prompt according to the requirements of the model.
-    user_prompts = [{
-                        "role": "system", "content": system_prompt
-                    },
-                    {
-                        "role": "user", "content": user_prompt
-                    }]
-    chat_prompt = tokenizer_llm.apply_chat_template(user_prompts, tokenize=tokenize, add_generation_prompt=add_generation_prompt)
-    return chat_prompt
 
 def main():
     
-    args = Arguments()
-
-    configs = args.configs
-    
+    args = Arguments()    
     
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     accelerator_log_kwargs = {}
@@ -79,16 +73,18 @@ def main():
     mt_path = args.mt_path
     ext_path = args.ext_path
     
-    token = 'HF access Token'
+    token = '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'
     login(token=token)
 
-   
-
-    dataset = configs.dataset
-    train_lang = configs.lang
-    train_limit = configs.train_limit
-
-    train_samples = dataset.get_train_set(train_lang, limit=train_limit)
+    train_samples = []
+    
+    ds = load_dataset("Themira/review_analysis", split="train")
+    
+    for example in ds:
+        train_samples.append({
+            'prompt': example['review'],
+            'target': example['response']
+        })
 
     args.train_num = len(train_samples)
     
@@ -120,13 +116,12 @@ def main():
     result_path_base = f'./results/{save_name}/{stage_name}/'
     output_model_path_base = f'./outputs/{save_name}/{stage_name}/'
     # tokenizer_m2m = AutoTokenizer.from_pretrained(mt_path)
-    tokenizer_llm = AutoTokenizer.from_pretrained(llm_path, use_fast=True)
+    tokenizer_llm = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct", use_fast=True)
     tokenizer_llm.pad_token = tokenizer_llm.eos_token
     tokenizer_llm.padding_side = "left"
     # tokenizer_llm.pad_token = "[PAD]"
 
     system_prompt = args.system_prompt
-    apply_chat_template_func = lambda user_prompt: apply_chat_template(system_prompt, user_prompt, tokenizer_llm)
     
     print(json.dumps({
         'llm_path': llm_path,
@@ -277,30 +272,25 @@ def main():
     
                     llm_input_prompts = [i for i in sources]
                     
-                    # if args.system_prompt is not None:
-                    #     user_prompts = [
-                    #         [{
-                    #             "role": "system", "content": args.system_prompt
-                    #         },
-                    #         {
-                    #             "role": "user", "content": user_prompt_function(sources[i])
-                    #         }]
-                    #         for i in range(len(sources))
-                    #     ]
+                    if args.system_prompt is not None:
+                        user_prompts = [
+                            [{
+                                "role": "system", "content": args.system_prompt
+                            },
+                            {
+                                "role": "user", "content": "Analyze the given review and return the aspect-based sentiment response."
+                            }]
+                            for i in range(len(sources))
+                        ]
 
-                    #     llm_input_prompts = [tokenizer_llm.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True) for prompt in user_prompts]
+                        llm_input_prompts = [tokenizer_llm.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True) for prompt in user_prompts]
                         
                     input_ids_prompt, mask_prompt = llm_input_features(llm_input_prompts, tokenizer_llm,
                                                                         max_gen_len, add_bos_token,
                                                                         add_eos_token)
 
-                
-                if system_prompt is not None:
-                    input_prompts = [apply_chat_template_func(source) for source in sources]
-                else:
-                    input_prompts = sources
 
-                output_loss = model(input_prompts,
+                output_loss = model(sources,
                             input_ids_prompt=input_ids_prompt, mask_prompt=mask_prompt,
                             labels=labels, mask_label=mask_label)
                 
@@ -321,12 +311,10 @@ def main():
                     avg_loss = accelerator.gather(total_loss).mean().item() / gradient_accumulation / args.logging_steps
                     total_loss = 0                   
                     print(f"  Step: {completed_steps}, LR: {lr_scheduler.get_last_lr()[0]}, Loss: {avg_loss}")
-                    model.log_gates()
                   
         epoch_model_path = f'./outputs/{save_name}/epoch_{epoch}_{stage_name}/'
         save_with_accelerate(accelerator, model, epoch_model_path)
         print('save epoch model')
-    model.clean_up()
     accelerator.wait_for_everyone()
 
     

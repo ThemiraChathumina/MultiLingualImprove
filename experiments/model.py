@@ -3,8 +3,126 @@ import torch
 from transformers import AutoTokenizer
 from torch import nn
 import torch.nn.functional as F
-from mlEmbModel import JSMMultilingualEmbeddingModel, TransSMMultilingualEmbeddingModel
-from Configs import IDPConfigs
+from transformers import AutoModelForCausalLM, AutoModel, AutoConfig
+import torch
+from transformers import AutoTokenizer
+from torch import nn
+import torch.nn.functional as F
+import csv 
+import numpy as np
+
+class JSMMultilingualEmbeddingModel(nn.Module):
+    ALLOWED_MODELS = {
+        "FacebookAI/xlm-roberta-base",
+        "FacebookAI/xlm-roberta-large",
+        "facebook/nllb-200-distilled-600M",
+        "facebook/nllb-200-1.3B",
+        "google/mt5-small",
+        "google/mt5-base",
+        "google/mt5-large",
+        "google/mt5-xl",
+        "DKYoon/mt5-small-lm-adapt",
+        "DKYoon/mt5-large-lm-adapt",
+        "DKYoon/mt5-xl-lm-adapt",
+        "facebook/nllb-200-distilled-1.3B"
+    }
+    
+    def __init__(self, embedding_model_base, embedding_model_ext, max_seq_len, freeze_embedding = True):
+        super().__init__()
+
+        if embedding_model_base not in self.ALLOWED_MODELS:
+            raise ValueError(f"Model is not in allowed models: {self.ALLOWED_MODELS}")
+        
+        self.embedding_model_base = AutoModel.from_pretrained(embedding_model_base)
+        if "nllb" in embedding_model_base or "mt5" in embedding_model_base:
+            self.embedding_model_base = self.embedding_model_base.encoder 
+
+        self.freeze_embedding = freeze_embedding
+        if freeze_embedding:
+            for param in self.embedding_model_base.parameters():
+                param.requires_grad = False
+            
+        self.tokenizer_base = AutoTokenizer.from_pretrained(embedding_model_base)
+
+        self.max_seq_len = max_seq_len
+        
+        self.embedding_dim_base = self.embedding_model_base.config.hidden_size
+        self.embedding_dim = self.embedding_dim_base
+
+        num_embedding_tokens = 1
+        self.num_embedding_tokens = num_embedding_tokens
+        self.learnable_queries_base = None
+        
+        # If using prepended queries, initialize them.
+        
+        self.num_layers = self.embedding_model_base.config.num_hidden_layers  # Exclude embedding layer
+        self.layer_weights_lb = nn.Parameter(torch.full((self.num_layers,), 3e-5))
+
+        self.base_temp = torch.tensor(1e2)
+        self.factor = torch.tensor(1e5)
+        self.temp = nn.Parameter(torch.tensor(1e-5))
+        
+
+        
+    def get_input_embeddings(self, model, input_ids):
+        if "M2M" in model.__class__.__name__:
+            return model.embed_tokens(input_ids)
+        return model.get_input_embeddings()(input_ids)
+
+    def mt_input_features(self, input_texts_m2m):
+        input_ids_m2m, attention_mask_m2m = [], []
+        for input_text_m2m in input_texts_m2m:
+            encoding_m2m = self.tokenizer_base(input_text_m2m,
+                                         padding='longest',
+                                         max_length=self.max_seq_len,
+                                         truncation=True)
+            input_ids_m2m_item = encoding_m2m.input_ids
+            attention_mask_m2m_item = encoding_m2m.attention_mask
+            input_ids_m2m.append(input_ids_m2m_item)
+            attention_mask_m2m.append(attention_mask_m2m_item)
+        max_len = max([len(item) for item in input_ids_m2m])
+        m2m_pad_id = self.tokenizer_base.pad_token_id
+        for input_ids_m2m_item, attention_mask_m2m_item in zip(input_ids_m2m, attention_mask_m2m):
+            while len(input_ids_m2m_item) < max_len:
+                input_ids_m2m_item.append(m2m_pad_id)
+                attention_mask_m2m_item.append(0)
+        input_ids_m2m = torch.tensor(input_ids_m2m, dtype=torch.long).cuda()
+        attention_mask_m2m = torch.tensor(attention_mask_m2m, dtype=torch.long).cuda()
+        return input_ids_m2m, attention_mask_m2m
+    
+    def get_last_hidden_states(self, encoded_inputs):
+        input_ids, attention_mask = self.mt_input_features(encoded_inputs)
+        outputs = self.embedding_model_base(input_ids=input_ids, attention_mask=attention_mask)
+        return outputs.last_hidden_state, attention_mask
+    
+    def softmax_gated(self, encoded_inputs):
+        input_ids, attention_mask = self.mt_input_features(encoded_inputs)
+
+        outputs = self.embedding_model_base(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        # Skip embeddings layer (hidden_states[0]), only use actual transformer layers
+        hidden_states_stacked = torch.stack(outputs.hidden_states[1:], dim=1)  # [B, L, T, D]
+
+        temp_applicable = self.base_temp + self.temp * self.factor
+        norm_weights = F.softmax(temp_applicable * self.layer_weights_lb, dim=0)  # [L]
+        norm_weights = norm_weights.view(1, -1, 1, 1)
+
+        fused_tokens = torch.sum(hidden_states_stacked * norm_weights, dim=1)  # [B, T, D]
+        return fused_tokens, attention_mask
+
+        
+    
+    def forward(self, encoded_inputs):
+        base_embeddings, base_attention_mask = self.softmax_gated(
+                encoded_inputs
+            )
+        return base_embeddings, base_attention_mask
+        
 
 class MLP(nn.Module):
     def __init__(self, mt_dim, llm_dim):
@@ -53,72 +171,14 @@ class Mapping(nn.Module):
     def get_embed(self):
         return self.end_boundary
 
-class FusionBlock(nn.Module):
-    def __init__(self, d_model, d_encoder, d_text, d_out, num_heads=8, num_layers=1, num_queries = 16):
-        super(FusionBlock, self).__init__()
-        self.num_queries = num_queries
-        self.learnable_queries = nn.Parameter(torch.randn(num_queries, d_model))
-        self.encoder_mapper = MLP(d_encoder, d_model)
-        self.text_mapper = MLP(d_text, d_model)
-        self.out_proj = MLP(d_model, d_out)
-        qformer_layer = nn.TransformerDecoderLayer(d_model, num_heads)
-        self.qformer = nn.TransformerDecoder(qformer_layer, num_layers)
-    
-    def forward(self, enc_embedding, enc_attention_mask, text_embedding, text_attention_mask):
-        # enc_embedding: [batch_size, seq_len, d_encoder]
-        # enc_attention_mask: [batch_size, seq_len]
-    
-        batch_size = enc_embedding.size(0)
-        seq_len = enc_embedding.size(1)
-    
-        # Step 1: Map encoder embeddings to d_model dimension
-        memory = self.encoder_mapper(enc_embedding)  # [batch_size, seq_len, d_model]
-        text = self.text_mapper(text_embedding)
-        
-        # Step 2: Prepare learnable query tokens as target input
-        # Expand queries for batch dimension
-        tgt = self.learnable_queries.unsqueeze(0).expand(batch_size, -1, -1)  # [batch_size, num_queries, d_model]
-
-        # Step 3: Create attention masks
-        tgt_attention_mask = torch.ones((batch_size, tgt.size(1)), dtype=torch.bool, device=enc_embedding.device)  # [batch_size, num_queries]
-        tgt_attention_mask = torch.cat([tgt_attention_mask, text_attention_mask], dim=1)
-        tgt = torch.cat([tgt, text], dim=1)
-        
-        # Convert attention masks to key padding masks (True = masked)
-        memory_key_padding_mask = ~enc_attention_mask.bool()  # [batch_size, seq_len]
-        tgt_key_padding_mask = ~tgt_attention_mask.bool()     # [batch_size, num_queries]
-
-        # Transformer expects shape: [tgt_len, batch_size, d_model] and [mem_len, batch_size, d_model]
-        tgt = tgt.transpose(0, 1)        # [num_queries, batch_size, d_model]
-        memory = memory.transpose(0, 1)  # [seq_len, batch_size, d_model]
-    
-        # Step 4: Run Q-Former decoder
-        qformer_output = self.qformer(
-            tgt,
-            memory,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask
-        )  # [num_queries, batch_size, d_model]
-    
-        # Step 5: Project Q-Former output to output dimension
-        qformer_output = qformer_output.transpose(0, 1)  # [batch_size, num_queries, d_model]
-        output = self.out_proj(qformer_output)           # [batch_size, num_queries, d_out]
-    
-        return output[:,:self.num_queries], tgt_attention_mask[:,:self.num_queries]
     
 class MPTModel(nn.Module):
     def __init__(self, config):
         super(MPTModel, self).__init__()
         self.config = config  # Ensure there is a config attribute
-        self.idp_configs = IDPConfigs()
         self.max_gen_len = config['max_gen_len']
 
-        if self.idp_configs.encoder == 'JSME':
-            self.encoder_mt = JSMMultilingualEmbeddingModel(config['mt_path'], config['ext_path'], config['max_seq_len'])
-        elif self.idp_configs.encoder == 'TransSM':
-            self.encoder_mt = TransSMMultilingualEmbeddingModel(config['mt_path'], config['ext_path'], config['max_seq_len'])
-        else:
-            raise ValueError("Invalid encoder type. Choose 'JSME' or 'TransSM'.")
+        self.encoder_mt = JSMMultilingualEmbeddingModel(config['mt_path'], config['ext_path'], config['max_seq_len'])
 
         model_llm = AutoModelForCausalLM.from_pretrained(config['llm_path'])
 
@@ -211,11 +271,3 @@ class MPTModel(nn.Module):
                                     labels=labels)
             return output.loss
     
-    def log_gates(self):
-        self.encoder_mt.log_softmax_gate()
-
-    def print_gates(self):
-        self.encoder_mt.print_softmax_gate()
-
-    def clean_up(self):
-        self.encoder_mt.close_csv()
