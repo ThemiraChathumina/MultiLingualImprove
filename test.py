@@ -3,7 +3,7 @@ from datasets import load_dataset
 import torch
 from huggingface_hub import login
 
-token = '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'
+token = 'token'
 login(token=token)
 
 # Path to checkpoint (replace with your path if needed)

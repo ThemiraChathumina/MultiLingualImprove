@@ -5,7 +5,7 @@ import torch
 import sys
 from huggingface_hub import login
 
-token = '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'
+token = 'token'
 login(token=token)
 
 # Load dataset

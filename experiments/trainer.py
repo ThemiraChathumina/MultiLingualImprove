@@ -73,7 +73,7 @@ def main():
     mt_path = args.mt_path
     ext_path = args.ext_path
     
-    token = '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'
+    token = 'token'
     login(token=token)
 
     train_samples = []
