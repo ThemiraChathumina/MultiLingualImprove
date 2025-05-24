@@ -31,5 +31,5 @@ apt install -y tmux
 apt install -y libopenmpi-dev
 
 pip install mpi4py
-pip install --upgrade transformers
+pip install --upgrade transformers==4.51.3
 # chmod +x setup.sh

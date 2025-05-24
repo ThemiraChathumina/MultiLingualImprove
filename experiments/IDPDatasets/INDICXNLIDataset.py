@@ -1,4 +1,4 @@
-from XNLIDataset import XNLIDataset
+from .XNLIDataset import XNLIDataset
 
 class INDICXNLIDataset(XNLIDataset):
     @property

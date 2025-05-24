@@ -5,8 +5,8 @@ from .INDICXNLIDataset import INDICXNLIDataset
 from .NewsDataset import NEWSDataset
 from .OLIDDataset import OLIDDataset
 from .SOLDDataset import SOLDDataset
-from .EnSentimentDataset import EnSentimentDataset
-from .SiSentimentDataset import SiSentimentDataset
+from .EnSentimentDataset import ENSENDataset
+from .SiSentimentDataset import SISENDataset
 
 __all__ = [
     "AbstractDataset",
@@ -16,7 +16,7 @@ __all__ = [
     "NEWSDataset",
     "OLIDDataset",
     "SOLDDataset",
-    "EnSentimentDataset",
-    "SiSentimentDataset",
+    "ENSENDataset",
+    "SISENDataset",
 ]
 # This module imports the AbstractDataset class and the AmazonReviewDataset class from their respective files.

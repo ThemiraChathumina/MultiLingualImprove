@@ -1,10 +1,10 @@
 from .abstractDataset import AbstractDataset
 from datasets import load_dataset
 
-class OLIDDataset(AbstractDataset):
+class SOLDDataset(AbstractDataset):
     @property
     def hf_path(self):
-        return "christophsonntag/OLID"
+        return "sinhala-nlp/SOLD"
 
     @property
     def training_languages(self):
